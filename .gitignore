@@ -1,0 +1,7 @@
+output/
+__pycache__/
+research/*.json
+research/*.png
+research/*.log
+research/browser-profile/
+research/*.txt
