@@ -107,7 +107,7 @@ class Scene:
             elif tag=='TEXR':
                 ch=children(b,p,n);h,_=ch['TXRH'];self.textures.append(dict(offset=p,size=n,signature=f'{u32(b,h+1):08x}',name=string(b[h+12:h+43]),width=struct.unpack_from('<H',b,h+5)[0],height=struct.unpack_from('<H',b,h+7)[0]))
             elif tag=='MATL':
-                ch=children(b,p,n);h,_=ch['MTLH'];self.materials[u32(b,h+21)]=dict(name=string(b[h+25:h+56]),textureSignature=f'{u32(b,h+1):08x}')
+                ch=children(b,p,n);h,_=ch['MTLH'];self.materials[u32(b,h+21)]=dict(name=string(b[h+25:h+56]),textureSignature=f'{u32(b,h+1):08x}',blendMode=b[h+57],cullMode=b[h+58],renderFlags=b[h+59],diffuseColor=[v/255 for v in b[h+60:h+64]],clampU=b[h+72],clampV=b[h+73],sortLayer=b[h+74],shaderHash=f'{u32(b,h+77):08x}')
             elif tag=='MESH':
                 ch=children(b,p,n);h,_=ch['MSHH'];self.meshes[u32(b,h+17)]=(p,n)
             elif tag=='GEOB':
@@ -145,7 +145,7 @@ class Scene:
                 if b[h]!=3:raise ValueError('Unsupported submesh header')
                 material=u32(b,h+6)
                 if material not in material_ids:
-                    material_ids[material]=len(materials);materials.append(self.materials.get(material,dict(name=f'{material:08x}',textureSignature=None)))
+                    material_ids[material]=len(materials);materials.append(dict(self.materials.get(material,dict(name=f'{material:08x}',textureSignature=None))))
                 mat=material_ids[material];vis=b[h+18];off,size=struct.unpack_from('<II',b,h+19)
                 palette=list(struct.unpack_from('<64H',b,sub['MPAL'][0])) if 'MPAL' in sub else []
                 if size:
@@ -174,14 +174,23 @@ class Scene:
         else:raise ValueError('Unknown quantized positions')
         uv=streams.get(2);normal=streams.get(3)
         if not uv or len(uv['values'])!=len(values) or (normal and len(normal['values'])!=len(values)):raise ValueError('Packet attribute count mismatch')
-        uvs=[[v[0]/4096,v[1]/4096] for v in uv['values']]
+        # UV2 stores triangle-strip ADC in V bit 0, not in the coordinate.
+        uvs=[[v[0]/4096,(v[1]&~1 if uv['components']==2 else v[1])/4096] for v in uv['values']]
         skin=bool(palette and skel and uv['components']==3)
         adc=[v[-1]&0x8000 for v in normal['values']] if skin else [v[3]&0x8000 for v in uv['values']] if uv['components']==4 else [not(v[1]&1) for v in uv['values']]
         indices=[]
         for i in range(2,len(values)):
             if not adc[i]:indices.extend([i-2,i-1,i] if i%2==0 else [i-1,i-2,i])
         result=dict(positions=positions,uvs=uvs,colors=[[1,1,1] for _ in values],indices=indices)
+        if normal and normal['bits'] in (5,8) and normal['components']==4:
+            # GS modulation uses 128 as unity; dividing by 255 halves baked light.
+            result['colors']=[[x/128 for x in v[:3]] for v in normal['values']]
+            result['alphas']=[max(0,min(1,v[3]/128)) for v in normal['values']]
+            result['bakedLighting']=True
+        elif normal and normal['bits']==16 and normal['components']==3:
+            result['normals']=[[x/32768 for x in v] for v in normal['values']]
         if skin:
+            result['normals']=[[x/32767 for x in v[:3]] for v in normal['values']]
             weights=[]
             for a,c in zip(uv['values'],normal['values']):
                 w=(a[2]&0xff00)/32768;i=(a[2]&255)//4;j=(c[3]&255)//4
@@ -196,7 +205,7 @@ class Scene:
         for p in range(h+27,h+hs-9,10):decl.append(struct.unpack_from('<6BI',b,p))
         vertex,vsize=sub['MVTX'];attrs={}
         for usage,index,typ,components,fract,stride,offset in decl:
-            if usage not in (0,1,2,5,9):continue
+            if usage not in (0,1,2,3,5,9):continue
             fmt={0:'f',2:'B',3:'h',4:'B'}.get(typ)
             if fmt is None:raise ValueError(f'Unsupported vertex declaration {typ}')
             rows=[]
@@ -212,6 +221,7 @@ class Scene:
             if len(set(t))==3:tri.extend(t if i%2==0 else t[::-1])
         if any(i>=count for i in tri):raise ValueError('Raw mesh index out of bounds')
         result=dict(positions=attrs[0],uvs=attrs.get(5,[[0,0]]*count),colors=[[1,1,1]]*count,indices=tri)
+        if 3 in attrs:result['normals']=attrs[3]
         if skel and 1 in attrs and 2 in attrs:
             weights=[]
             for joints,ws in zip(attrs[2],attrs[1]):

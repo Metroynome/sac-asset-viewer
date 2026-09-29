@@ -11,11 +11,11 @@ window.createModelViewer = async function(container, url, signal, initialBank, o
   const gl=canvas.getContext('webgl',{antialias:true,alpha:false});if(!gl)throw Error('WebGL is unavailable in this browser.');
   const shader=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;};
   const vs=shader(gl.VERTEX_SHADER,`attribute vec3 position;attribute vec3 normal;attribute vec2 uv;attribute vec3 color;uniform mat4 mvp;varying vec3 n;varying vec2 tex;varying vec3 col;void main(){gl_Position=mvp*vec4(position,1.0);n=normal;tex=uv;col=color;}`);
-  const fs=shader(gl.FRAGMENT_SHADER,`precision mediump float;varying vec3 n;varying vec2 tex;varying vec3 col;uniform sampler2D image;uniform bool textured;uniform bool wire;void main(){vec4 c=textured?texture2D(image,tex):vec4(0.65,0.77,0.8,1.0);if(c.a<0.15)discard;float light=0.35+0.65*abs(dot(normalize(n),normalize(vec3(0.4,-0.6,1.0))));gl_FragColor=wire?vec4(0.36,0.9,0.84,1.0):vec4(c.rgb*col*light,1.0);}`);
+  const fs=shader(gl.FRAGMENT_SHADER,`precision mediump float;varying vec3 n;varying vec2 tex;varying vec3 col;uniform sampler2D image;uniform bool textured;uniform bool wire;uniform bool unlit;uniform bool baked;void main(){vec4 c=textured?texture2D(image,tex):vec4(0.65,0.77,0.8,1.0);if(c.a<0.15)discard;float light=(unlit||baked)?1.0:0.8+0.2*max(0.0,dot(normalize(n),normalize(vec3(0.4,0.8,1.0))));gl_FragColor=wire?vec4(0.36,0.9,0.84,1.0):vec4(c.rgb*col*light,1.0);}`);
   const program=gl.createProgram();gl.attachShader(program,vs);gl.attachShader(program,fs);gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));gl.useProgram(program);
   const attr={};for(const k of ['position','normal','uv','color'])attr[k]=gl.getAttribLocation(program,k);
-  const uniform={};for(const k of ['mvp','textured','wire','image'])uniform[k]=gl.getUniformLocation(program,k);
-  let disposed=false,raf=0,lod=model.defaultLod||0,wire=false,textured=true,az=model.skeleton?Math.PI+0.65:0.65,el=0.3,zoom=1,pan=[0,0],drag=null;
+  const uniform={};for(const k of ['mvp','textured','wire','image','unlit','baked'])uniform[k]=gl.getUniformLocation(program,k);
+  let disposed=false,raf=0,lod=model.defaultLod||0,wire=false,textured=true,unlit=false,az=model.skeleton?Math.PI+0.65:0.65,el=0.3,zoom=1,pan=[0,0],drag=null;
   const min=model.bounds[0],max=model.bounds[1],center=min.map((v,i)=>(v+max[i])/2),radius=Math.max(0.0001,Math.hypot(...max.map((v,i)=>(v-min[i])/2)));
   const chunks=[];const textures=[];
   let bank=null,clip=null,playing=false,time=0,lastTime=0,poseDirty=false,loadSequence=0;
@@ -29,12 +29,15 @@ window.createModelViewer = async function(container, url, signal, initialBank, o
   }
 
   function uploadGeometry(matrices=null){
+    // Inverse-transpose handles animated nonuniform scale as well as rotation.
+    const normalMatrices=matrices?.map(m=>{const a=[m[0],m[1],m[2]],b=[m[4],m[5],m[6]],c=[m[8],m[9],m[10]];const cross=(u,v)=>[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];const x=cross(b,c),y=cross(c,a),z=cross(a,b),det=a.reduce((v,n,i)=>v+n*x[i],0);return [...x,...y,...z].map(v=>v/(Math.abs(det)>1e-12?det:1));});
     const bucket=new Map();
-    for(const m of model.meshes){if(matrices&&m.lod!==0)continue;const key=m.lod+':'+m.material;if(!bucket.has(key))bucket.set(key,{lod:m.lod,material:m.material,values:[],lines:[]});const b=bucket.get(key);
+    for(const m of model.meshes){if(matrices&&m.lod!==0)continue;const key=m.lod+':'+m.material+':'+!!m.bakedLighting;if(!bucket.has(key))bucket.set(key,{lod:m.lod,material:m.material,baked:!!m.bakedLighting,values:[],lines:[]});const b=bucket.get(key);
       const positions=matrices&&m.weights?m.positions.map((p,i)=>{const out=[0,0,0];for(let j=0;j<m.joints.length;j++){const weight=m.weights[i][j];if(!weight)continue;const mat=matrices[m.joints[j]];for(let k=0;k<3;k++)out[k]+=weight*(mat[k]*p[0]+mat[4+k]*p[1]+mat[8+k]*p[2]+mat[12+k]);}return out;}):m.positions;
-      for(let i=0;i<m.indices.length;i+=3){const ids=m.indices.slice(i,i+3),p=ids.map(j=>positions[j]);const a=p[1].map((v,k)=>v-p[0][k]),c=p[2].map((v,k)=>v-p[0][k]);let n=[a[1]*c[2]-a[2]*c[1],a[2]*c[0]-a[0]*c[2],a[0]*c[1]-a[1]*c[0]],len=Math.hypot(...n)||1;n=n.map(v=>v/len);const verts=ids.map((j,k)=>[...p[k].map((v,d)=>(v-center[d])/radius),...n,...(m.uvs[j]||[0,0]),...(m.colors[j]||[1,1,1])]);b.values.push(...verts.flat());b.lines.push(...verts[0],...verts[1],...verts[1],...verts[2],...verts[2],...verts[0]);}}
-    const old=new Map(chunks.map(c=>[c.lod+':'+c.material,c]));chunks.length=0;
-    for(const [key,b] of bucket){const prev=old.get(key);old.delete(key);const upload=(values,handle)=>{handle=handle||gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,handle);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(values),model.skeleton?gl.DYNAMIC_DRAW:gl.STATIC_DRAW);return handle;};chunks.push({lod:b.lod,material:b.material,solid:upload(b.values,prev?.solid),lines:upload(b.lines,prev?.lines),count:b.values.length/11,lineCount:b.lines.length/11});}
+      const normals=normalMatrices&&m.weights&&m.normals?m.normals.map((n,i)=>{const out=[0,0,0];for(let j=0;j<m.joints.length;j++){const w=m.weights[i][j];if(!w)continue;const mat=normalMatrices[m.joints[j]];for(let k=0;k<3;k++)out[k]+=w*(mat[k]*n[0]+mat[3+k]*n[1]+mat[6+k]*n[2]);}const len=Math.hypot(...out)||1;return out.map(v=>v/len);}):m.normals;
+      for(let i=0;i<m.indices.length;i+=3){const ids=m.indices.slice(i,i+3),p=ids.map(j=>positions[j]);const a=p[1].map((v,k)=>v-p[0][k]),c=p[2].map((v,k)=>v-p[0][k]);let n=[a[1]*c[2]-a[2]*c[1],a[2]*c[0]-a[0]*c[2],a[0]*c[1]-a[1]*c[0]],len=Math.hypot(...n)||1;n=n.map(v=>v/len);const verts=ids.map((j,k)=>[...p[k].map((v,d)=>(v-center[d])/radius),...(normals?.[j]&&Math.hypot(...normals[j])>1e-6?normals[j]:n),...(m.uvs[j]||[0,0]),...(m.colors[j]||[1,1,1])]);b.values.push(...verts.flat());b.lines.push(...verts[0],...verts[1],...verts[1],...verts[2],...verts[2],...verts[0]);}}
+    const old=new Map(chunks.map(c=>[c.lod+':'+c.material+':'+c.baked,c]));chunks.length=0;
+    for(const [key,b] of bucket){const prev=old.get(key);old.delete(key);const upload=(values,handle)=>{handle=handle||gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,handle);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(values),model.skeleton?gl.DYNAMIC_DRAW:gl.STATIC_DRAW);return handle;};chunks.push({lod:b.lod,material:b.material,baked:b.baked,solid:upload(b.values,prev?.solid),lines:upload(b.lines,prev?.lines),count:b.values.length/11,lineCount:b.lines.length/11});}
     for(const b of old.values()){gl.deleteBuffer(b.solid);gl.deleteBuffer(b.lines);}
   }
   uploadGeometry();
@@ -49,12 +52,12 @@ const dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,Math.round(canvas.clientW
     if(model.upAxis==='y'||model.skeleton){const y=view.slice(4,8);view.splice(4,4,...view.slice(8,12));view.splice(8,4,...y.map(v=>-v));}
     const near=0.002,far=200,f=1/Math.tan(Math.PI/8),proj=[f/(w/h),0,0,0,0,f,0,0,0,0,(far+near)/(near-far),-1,0,0,2*far*near/(near-far),0],mvp=new Float32Array(16);
     for(let c=0;c<4;c++)for(let r=0;r<4;r++)for(let k=0;k<4;k++)mvp[c*4+r]+=proj[k*4+r]*view[c*4+k];
-    gl.uniformMatrix4fv(uniform.mvp,false,mvp);gl.uniform1i(uniform.wire,wire);gl.uniform1i(uniform.image,0);
-    for(const b of chunks){if(b.lod!==lod)continue;gl.bindBuffer(gl.ARRAY_BUFFER,wire?b.lines:b.solid);for(const [name,num,off] of [['position',3,0],['normal',3,12],['uv',2,24],['color',3,32]]){gl.enableVertexAttribArray(attr[name]);gl.vertexAttribPointer(attr[name],num,gl.FLOAT,false,44,off);}const t=textures[b.material];gl.uniform1i(uniform.textured,!!(textured&&t));gl.bindTexture(gl.TEXTURE_2D,t||null);gl.drawArrays(wire?gl.LINES:gl.TRIANGLES,0,wire?b.lineCount:b.count);}
+    gl.uniformMatrix4fv(uniform.mvp,false,mvp);gl.uniform1i(uniform.wire,wire);gl.uniform1i(uniform.unlit,unlit);gl.uniform1i(uniform.image,0);
+    for(const b of chunks){if(b.lod!==lod)continue;gl.uniform1i(uniform.baked,b.baked);gl.bindBuffer(gl.ARRAY_BUFFER,wire?b.lines:b.solid);for(const [name,num,off] of [['position',3,0],['normal',3,12],['uv',2,24],['color',3,32]]){gl.enableVertexAttribArray(attr[name]);gl.vertexAttribPointer(attr[name],num,gl.FLOAT,false,44,off);}const t=textures[b.material];gl.uniform1i(uniform.textured,!!(textured&&t));gl.bindTexture(gl.TEXTURE_2D,t||null);gl.drawArrays(wire?gl.LINES:gl.TRIANGLES,0,wire?b.lineCount:b.count);}
     if(playing&&clip)schedule();
   }
   function toggle(label,value,change){const l=node('label'),input=node('input');input.type='checkbox';input.checked=value;input.onchange=()=>{change(input.checked);schedule();};l.append(input,document.createTextNode(label));toolbar.append(l);}
-  toggle('Textures',true,v=>textured=v);toggle('Wireframe',false,v=>wire=v);
+  toggle('Textures',true,v=>textured=v);toggle('Unlit',false,v=>unlit=v);toggle('Wireframe',false,v=>wire=v);
   const lodSelect=node('select');lodSelect.setAttribute('aria-label','Moby detail level');for(const l of model.lods)lodSelect.add(new Option('LOD '+l.level,l.level));lodSelect.onchange=()=>{lod=Number(lodSelect.value);schedule();};lodSelect.value=String(lod);toolbar.append(lodSelect);
   const reset=node('button','Reset view');reset.onclick=()=>{az=model.skeleton?Math.PI+0.65:0.65;el=0.3;zoom=1;pan=[0,0];schedule();};toolbar.append(reset);
   const bankSelect=node('select'),clipSelect=node('select'),play=node('button','Play'),seek=node('input'),clock=node('span'),speed=node('select');

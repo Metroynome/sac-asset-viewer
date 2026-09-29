@@ -13,6 +13,8 @@ import cooked
 import sac_animation
 import sac_textures
 import symbols
+import levels
+import threading
 from formats import png, gim
 
 HERE=Path(__file__).resolve().parent
@@ -111,6 +113,8 @@ def build(root,out):
 
 
 def serve(root,out,index,port):
+    index=dict(index,assets=[a for a in index['assets'] if a['category']!='Levels']+levels.catalog(root))
+    index['counts']=dict(collections.Counter(a['category'] for a in index['assets']))
     by_id={x['id']:x for x in index['assets']};textures=collections.defaultdict(list)
     for row in index['assets']:
         if row.get('preview') and row.get('signature'):textures[row['signature']].append(row)
@@ -121,9 +125,13 @@ def serve(root,out,index,port):
         for mat in model['materials']:
             choices=textures.get(mat['textureSignature'],[]);same=[x for x in choices if x['archive']==row['archive']]
             common=[x for x in choices if x['archive'] in ('Levels/Common.san.cooked','Levels/RatchetCommon.san.cooked')]
-            choices=same or common or choices[:1]
+            choices=same or common or (choices if len(choices)==1 else [])
             if choices:mat['textureUrl']='/asset/'+choices[0]['id']+'/png'
         return json.dumps(model,allow_nan=False,separators=(',',':')).encode()
+    level_lock=threading.Lock()
+    @functools.lru_cache(maxsize=1)
+    def level_data(key):
+        return levels.assemble(root,by_id[key],index['assets'],lambda key:json.loads(model_json(key)))
     def animation_json(row,model_id=None):
         model=by_id[model_id or row['modelId']]
         if model.get('libraryHash')!=row['libraryHash']:raise ValueError('Animation library does not match model')
@@ -141,11 +149,16 @@ def serve(root,out,index,port):
             url=urllib.parse.urlsplit(self.path);path=url.path
             try:
                 if path=='/':return self.send((HERE/'web/index.html').read_bytes(),'text/html; charset=utf-8')
-                if path=='/web/model-viewer.js':return self.send((HERE/'web/model-viewer.js').read_bytes(),'text/javascript; charset=utf-8')
+                if path in ('/web/model-viewer.js','/web/level-viewer.js'):return self.send((HERE/path.lstrip('/')).read_bytes(),'text/javascript; charset=utf-8')
                 if path=='/api/index':return self.send(json.dumps(index,ensure_ascii=False).encode(),'application/json')
-                match=re.fullmatch(r'/asset/([a-f0-9]{20})/(raw|png|info|model|animation|symbols)',path)
+                match=re.fullmatch(r'/asset/([a-f0-9]{20})/(raw|png|info|model|animation|symbols|level|level-bin)',path)
                 if not match or match[1] not in by_id:return self.send(b'Not found','text/plain',404)
                 row=by_id[match[1]];action=match[2]
+                if action in ('level','level-bin'):
+                    if row['category']!='Levels':raise ValueError('Not a level')
+                    with level_lock:data,binary=level_data(row['id'])
+                    return self.send(binary if action=='level-bin' else json.dumps(data,allow_nan=False).encode(),'application/octet-stream' if action=='level-bin' else 'application/json')
+                if action=='info' and row['category']=='Levels':return self.send(json.dumps(row).encode(),'application/json')
                 if action=='model':return self.send(model_json(row['id']),'application/json')
                 if action=='animation':return self.send(json.dumps(animation_json(row,urllib.parse.parse_qs(url.query).get('model',[None])[0]),allow_nan=False).encode(),'application/json')
                 if action=='png':return self.send((out/row['preview']).read_bytes(),'image/png')
@@ -158,7 +171,9 @@ def serve(root,out,index,port):
                 if row['category']=='Animation' and row.get('modelId'):detail['clips']=[dict(name=c['name'],duration=c['duration'],tracks=len(c['tracks'])) for c in animation_json(row)['clips']]
                 return self.send(json.dumps(detail,ensure_ascii=False).encode(),'application/json')
             except (ValueError,KeyError,OSError,struct.error,IndexError,OverflowError) as exc:self.send(str(exc).encode(),'text/plain',422)
-    server=http.server.ThreadingHTTPServer(('127.0.0.1',port),Handler)
+    class Server(http.server.ThreadingHTTPServer):
+        request_queue_size=64
+    server=Server(('127.0.0.1',port),Handler)
     print(f'Browse http://127.0.0.1:{server.server_port}',flush=True)
     try:server.serve_forever()
     except KeyboardInterrupt:pass
